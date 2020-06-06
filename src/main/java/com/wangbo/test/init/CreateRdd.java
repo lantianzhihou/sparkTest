@@ -2,19 +2,32 @@ package com.wangbo.test.init;
 
 import java.io.Serializable;
 import java.lang.management.ManagementFactory;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.Iterator;
 import java.util.List;
 import java.util.stream.Stream;
 
+import org.apache.log4j.Level;
+import org.apache.log4j.Logger;
+import org.apache.spark.Dependency;
+import org.apache.spark.HashPartitioner;
+import org.apache.spark.Partition;
+import org.apache.spark.Partitioner;
 import org.apache.spark.SparkConf;
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
+import org.apache.spark.api.java.Optional;
+import org.apache.spark.api.java.function.Function2;
+import org.apache.spark.api.java.function.VoidFunction;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.util.LongAccumulator;
 import org.junit.Test;
 
 import scala.Tuple2;
+import scala.collection.Seq;
 
 /**
  * Spark 2.4.4支持 lambda表达式 以简洁地编写函数,在Spark 2.2.0中已删除了对Java 7的支持
@@ -114,6 +127,7 @@ public class CreateRdd implements Serializable{
 		
 //		JavaRDD<String> fileRDD = sc.textFile("F:\\ceshi.txt");
 		JavaRDD<String> fileRDD = sc.parallelize(Arrays.asList("abc","bd","c","abc","d","e","bd","c","abc"));
+		System.out.println("默认分区数：" + fileRDD.getNumPartitions()); // 1
 		
 		JavaPairRDD<String, Integer> pairRDD = fileRDD.mapToPair(s -> new Tuple2<String,Integer>(s, 1));
 		JavaPairRDD<String, Integer> reduceRDD = pairRDD.reduceByKey((a, b) -> a + b, 4).cache();
@@ -141,8 +155,89 @@ public class CreateRdd implements Serializable{
 	}
 	
 	@Test
-	public void testGroupAndAggregate() {
+	public void testGroup() {
+		SparkConf conf = new SparkConf().setAppName("Group").setMaster("local");
+		JavaSparkContext sc = new JavaSparkContext(conf);
+
+		JavaRDD<People> peopleRDD = sc.parallelize(Arrays.asList(new People("lily", 12),
+		        new People("han", 13), new People("meimei", 14), new People("dudu", 18)));
+		JavaPairRDD<Integer, Iterable<People>> groupRDD1 = peopleRDD.groupBy(People::getAge, 4);
 		
+		JavaRDD<String> fileRDD = sc.parallelize(Arrays.asList("abc","bd","c","abc","d","e","bd","c","abc"),5);
+		JavaPairRDD<String, Integer> stringRDD = fileRDD.mapToPair(s -> new Tuple2<String,Integer>(s, 1));
+		JavaPairRDD<String, Integer> acountRDD = stringRDD.reduceByKey((a,b) -> a+b);
+		acountRDD.foreach(t -> {
+			System.out.println(t._1 + "出现的次数为：" + t._2);
+		});
+		sc.close();
+	}
+	
+	@SuppressWarnings("serial")
+	@Test
+	public void testAggregate() {
+		SparkConf conf = new SparkConf().setAppName("Group").setMaster("local");
+		JavaSparkContext sc = new JavaSparkContext(conf);
+		/**
+		 * 	设置spark的日志等级：
+		 * 		1.在程序中设置spark的日志打印级别：sc.setLogLevel()或者Logger.getLogger("org.apache.spark").setLevel()
+		 *	 	2.在主配置文件中配置org.apache.spark的级别，spark默认采用spark-core包中log4j-defaults.properties作为日志配置
+		 */
+//		sc.setLogLevel(Level.ERROR.toString());
+//		Logger.getLogger("org.apache.spark").setLevel(Level.ERROR);
+		
+		List<Tuple2<String, Integer>> abk = Arrays.asList(new Tuple2<String, Integer>("class1", 1),
+		        new Tuple2<String, Integer>("class1", 2), new Tuple2<String, Integer>("class1", 4),
+		        new Tuple2<String, Integer>("class2", 3), new Tuple2<String, Integer>("class2", 1),
+		        new Tuple2<String, Integer>("class2", 5), new Tuple2<String, Integer>("class3", 2),
+		        new Tuple2<String, Integer>("class3", 3), new Tuple2<String, Integer>("class3", 4));
+		JavaPairRDD<String, Integer> abkrdd = sc.parallelizePairs(abk, 5).cache();
+		/**
+		 * 	根据方法mapPartitionsWithIndex算子中的打印可以知道数据集的分区情况
+		 */
+		abkrdd.mapPartitionsWithIndex(
+		        new Function2<Integer, Iterator<Tuple2<String, Integer>>, Iterator<String>>() {
+			        @Override
+			        public Iterator<String> call(Integer s, Iterator<Tuple2<String, Integer>> v)
+			                throws Exception {
+				        List<String> li = new ArrayList<>();
+				        while (v.hasNext()) {
+					        li.add("data：" + v.next() + " in " + (s + 1) + " " + " partition");
+				        }
+				        return li.iterator();
+			        }
+		        }, true).foreach(m -> System.out.println(m));
+		/**
+		 *  聚合方法aggregateByKey的四个参数：
+		 *  	1.zeroValue表示每个分区的键对应的初始对比值，只在算子seqFunc中使用，
+		 *  	例如abkrdd的分区4中有（'class2',5）、('class3',2),则会对应增加初始值*（'class2',zeroValue）、（'class3',zeroValue）
+		 *  	2.算子seqFunc的运算在每个分区分别执行reduceByKey运算 => 即按键分解
+		 *  	3.partitioner或numPartitions表示执行算子combFunc时的可用分区,如果未指定使用abkrdd的分区数
+		 *  	（将计算放入numPartitions个分区中计算）
+		 *  	4.算子combFunc将执行完算子seqFunc后数据集一起执行reduceByKey运算 => 即按键分解
+		 */
+		JavaPairRDD<String, Integer> abkrdd2 = abkrdd.aggregateByKey(0, 6,
+		        new Function2<Integer, Integer, Integer>() {
+			        @Override
+			        public Integer call(Integer s, Integer v) throws Exception {
+				        System.out.println("seq:" + s + "," + v);
+				        return Math.max(s, v);
+			        }
+		        }, new Function2<Integer, Integer, Integer>() {
+			        @Override
+			        public Integer call(Integer s, Integer v) throws Exception {
+				        System.out.println("com:" + s + "," + v);
+				        return s + v;
+			        }
+		        });
+
+		abkrdd2.foreach(new VoidFunction<Tuple2<String, Integer>>() {
+			@Override
+			public void call(Tuple2<String, Integer> s) throws Exception {
+				System.out.println("c:" + s._1 + ",v:" + s._2);
+			}
+		});
+
+		sc.close();
 	}
 	
 	/**
@@ -208,6 +303,20 @@ public class CreateRdd implements Serializable{
 		SparkSession sparkSession = SparkSession.builder().config(conf).getOrCreate();
 	
 		sparkSession.close();
+	}
+	
+	@Test
+	public void testAccumulator() {
+		SparkConf conf = new SparkConf().setAppName("Accumulator").setMaster("local[3]");
+		JavaSparkContext sc = new JavaSparkContext(conf);
+//		sc.setCheckpointDir(dir);
+		
+		LongAccumulator accumulator = sc.sc().longAccumulator();
+		JavaRDD<Integer> listRDD = sc.parallelize(Arrays.asList(1,2,3,4,5,6,7,8,9),4);
+		listRDD.foreach(i -> accumulator.add(i));
+		System.out.println("数组累计之和为： " + accumulator.value());
+		
+		sc.stop();
 	}
 	
 	
