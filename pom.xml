@@ -67,7 +67,7 @@
 		<dependency>
 			<groupId>org.apache.hadoop</groupId>
 			<artifactId>hadoop-common</artifactId>
-			<version>2.6.5</version>
+			<version>2.10.1</version>
 		</dependency>
 
 		<!-- 访问HDFS群集，需要hadoop-client为您的HDFS版本添加依赖项 -->
